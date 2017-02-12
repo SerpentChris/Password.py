@@ -1,0 +1,210 @@
+#!/usr/bin/env python3
+import secrets
+import keyring
+import json
+import argparse
+import os
+import subprocess
+import sys
+import string
+
+WALLET = 'password.py'
+ACCOUNTS = os.path.join(os.path.expanduser('~'),
+                        '.password',
+                        'accounts.json')
+MODE = 0o600
+
+
+class PasswordsDict:
+    def __init__(self, accounts):
+        self.accounts = set(accounts)
+
+    def __getitem__(self, key):
+        if key not in self.accounts:
+            raise KeyError
+        return keyring.get_password(WALLET, key)
+
+    def __setitem__(self, key, password):
+        keyring.set_password(WALLET, key, password)
+        self.accounts.add(key)
+
+    def __iter__(self):
+        return iter(self.accounts)
+
+    def __len__(self):
+        return len(self.accounts)
+
+    def __contains__(self, key):
+        return key in self.accounts
+
+    def pop(self, key):
+        result = self[key]
+        keyring.delete_password(WALLET, key)
+        self.accounts.remove(key)
+        return result
+
+    @property
+    def accounts_json(self):
+        return {'accounts': sorted(self.accounts)}
+
+if sys.platform == 'darwin':
+    def _copy(data: bytes):
+        pbcopy = subprocess.Popen(['pbcopy'], stdin=subprocess.PIPE)
+        pbcopy.communicate(input=data)
+        pbcopy.wait()
+        return pbcopy.returncode
+elif sys.platform.startswith('linux') or sys.platform.startswith('freebsd'):
+    def _copy(data: bytes):
+        xclip = subprocess.Popen(['xclip', '-selection', 'clipboard'], stdin=subprocess.PIPE)
+        xclip.communicate(input=data)
+        xclip.wait()
+        return xclip.returncode
+elif sys.platform == 'win32':
+    def _copy(data: bytes):
+        clip = subprocess.Popen(['clip'], stdin=subprocess.PIPE)
+        clip.communicate(input=data)
+        clip.wait()
+        return clip.returncode
+elif sys.platform == 'cygwin':
+    def _copy(data: bytes):
+        with open('/dev/clipboard', 'w+') as clipboard:
+            clipboard.write(data)
+            clipboard.write('\n'.encode())
+        return 0
+else:
+    print('not supported on your platform:', sys.platform)
+    sys.exit(1)
+
+
+def remove(args, passwords):
+    try:
+        passwords.pop(args.account)
+    except KeyError:
+        print('No such password!')
+        sys.exit(1)
+
+
+def print_password(args, passwords):
+    try:
+        print(passwords[args.account])
+    except KeyError:
+        print('No such password!')
+        sys.exit(1)
+
+
+def list_accounts(args, passwords):
+    for account in passwords:
+        print(account)
+
+
+def copy(args, passwords):
+    if args.account not in passwords:
+        print('No such account!')
+        sys.exit(1)
+        
+    code = _copy(passwords[args.account].encode())
+    if code != 0:
+        print('Copy Failed!')
+        sys.exit(1)
+
+
+def has_one(string, symbols):
+    for c in symbols:
+        if c in string:
+            return True
+    return False
+
+
+def new(args, passwords):
+    if args.account in passwords and not args.force:
+        print('Account already exists')
+        sys.exit(1)
+
+    if args.mode == 'xkcd':
+        with open('/usr/share/dict/words') as wf:
+            words = list(map(str.strip, wf))
+        password = []
+        for i in range(args.length):
+            password.append(secrets.choice(words))
+        result = ' '.join(password)
+    elif args.mode == 'hex':
+        result = secrets.token_hex(args.length)
+    elif args.mode == 'base64':
+        result = secrets.token_urlsafe(args.length)
+    elif args.mode == 'lame':
+        categories = [string.ascii_letters, string.digits, string.punctuation]
+        symbols = ''.join(categories)
+        while True:
+            password = []
+
+            for i in range(args.length):
+                password.append(secrets.choice(symbols))
+
+            for category in categories:
+                if not has_one(password, category):
+                    break
+            else:
+                result = ''.join(password)
+                break
+            
+    else:
+        raise ValueError('Unsupported password generation mode!')
+
+    passwords[args.account] = result
+
+
+def _init_password_dir():
+    if not os.path.isdir(os.path.dirname(ACCOUNTS)):
+        os.mkdir(os.path.dirname(ACCOUNTS))
+
+    if not os.path.isfile(ACCOUNTS):
+        with open(ACCOUNTS, 'w') as af:
+            json.dump({'accounts':[]}, af, indent=4)
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Create,store, and copy passwords.')
+    subparsers = parser.add_subparsers(title='commands')
+
+    copy_p = subparsers.add_parser('copy', aliases=['cp'], help='Copy a password to the clipboard.')
+    copy_p.add_argument('account', help='The account whose password is copied to the clipboard')
+    copy_p.set_defaults(func=copy)
+
+    new_p = subparsers.add_parser('new', help='Create a new password.')
+    new_p.add_argument('account', help='The account name for the new password.')
+    new_p.add_argument('-l', '--length', help='Length of the password. In hex and base64 mode, this is the number of random bytes used. In xkcd mode, it\'s the number of words, and in lame mode it\'s the number of characters.', type=int, default=32)
+    new_p.add_argument('-f', '--force', help='Overwrite the old password, if there is one.', action='store_true', default=False)
+    new_p.add_argument('-m', '--mode', choices=['xkcd', 'hex', 'base64', 'lame'], help='Password generation mode.', default='hex')
+    new_p.set_defaults(func=new)
+
+    print_p = subparsers.add_parser('print', help='Print a password to the terminal.')
+    print_p.add_argument('account', help='Print this account\'s password.')
+    print_p.add_argument('-c', '--chunk', help='Chunks the password into multiple lines.', action='store_true', default=False)
+    print_p.set_defaults(func=print_password)
+
+    list_p = subparsers.add_parser('list', help='Print all account names.')
+    list_p.set_defaults(func=list_accounts)
+
+    remove_p = subparsers.add_parser('remove', aliases=['rm'], help='Remove an account\'s password.')
+    remove_p.add_argument('account', help='Account to delete.')
+    remove_p.set_defaults(func=remove)
+
+    args = parser.parse_args()
+
+    _init_password_dir()
+    
+    with open(ACCOUNTS) as af:
+        account_json = json.load(af)
+        passwords = PasswordsDict(set(account_json['accounts']))
+
+    try:
+        args.func(args, passwords)
+    except AttributeError:
+        parser.print_help()
+        sys.exit(1)
+
+    with open(ACCOUNTS, 'w') as af:
+        json.dump(passwords.accounts_json, af, indent=4)
+
+if __name__ == '__main__':
+    main()
